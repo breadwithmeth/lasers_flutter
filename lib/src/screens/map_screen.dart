@@ -9,6 +9,7 @@ import '../models/device.dart';
 import '../services/api_service.dart';
 import 'login_screen.dart';
 import 'schedules_screen.dart';
+import 'users_screen.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -33,6 +34,7 @@ class _MapScreenState extends State<MapScreen> {
   String _search = '';
   bool _sortByActivity = true; // activity desc vs id asc
   final TextEditingController _searchCtrl = TextEditingController();
+  bool _loadingUser = false;
 
   @override
   void initState() {
@@ -52,6 +54,7 @@ class _MapScreenState extends State<MapScreen> {
         const Duration(seconds: 15),
         (_) => _load(silent: true),
       );
+      _ensureCurrentUser();
     }
   }
 
@@ -61,6 +64,20 @@ class _MapScreenState extends State<MapScreen> {
     _polling = false;
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _ensureCurrentUser() async {
+    final api = ApiProvider.of(context);
+    if (api.currentUser != null || _loadingUser) return;
+    setState(() => _loadingUser = true);
+    try {
+      await api.fetchCurrentUser(force: true);
+      if (mounted) setState(() {});
+    } catch (_) {
+      // ignore silently
+    } finally {
+      if (mounted) setState(() => _loadingUser = false);
+    }
   }
 
   Future<void> _load({bool silent = false}) async {
@@ -328,6 +345,27 @@ class _MapScreenState extends State<MapScreen> {
       appBar: AppBar(
         title: const Text('Lasers'),
         actions: [
+          if (ApiProvider.of(context).currentUser?.isSuperAdmin ?? false)
+            IconButton(
+              tooltip: 'Пользователи',
+              onPressed: () async {
+                final api = ApiProvider.of(context);
+                // ensure we have current user loaded (silent)
+                try {
+                  await api.fetchCurrentUser(force: false);
+                } catch (_) {}
+                if (!mounted) return;
+                Navigator.of(
+                  context,
+                ).push(MaterialPageRoute(builder: (_) => const UsersScreen()));
+              },
+              icon: const Icon(Icons.group),
+            ),
+          IconButton(
+            tooltip: 'Профиль',
+            onPressed: _openProfile,
+            icon: const Icon(Icons.account_circle),
+          ),
           IconButton(
             tooltip: 'Расписания',
             onPressed: () {
@@ -612,6 +650,96 @@ class _MapScreenState extends State<MapScreen> {
     return '${diff.inDays}d';
   }
 
+  Future<void> _openProfile() async {
+    final api = ApiProvider.of(context);
+    if (api.currentUser == null) {
+      await _ensureCurrentUser();
+    }
+    if (!mounted) return;
+    final u = api.currentUser;
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        if (u == null) {
+          return const AlertDialog(
+            title: Text('Профиль'),
+            content: SizedBox(
+              height: 60,
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          );
+        }
+        String fmt(DateTime? d) {
+          if (d == null) return '—';
+          final l = d.toLocal();
+          final y = l.year.toString().padLeft(4, '0');
+          final mo = l.month.toString().padLeft(2, '0');
+          final da = l.day.toString().padLeft(2, '0');
+          final h = l.hour.toString().padLeft(2, '0');
+          final m = l.minute.toString().padLeft(2, '0');
+          return '$y-$mo-$da $h:$m';
+        }
+
+        return AlertDialog(
+          title: const Text('Профиль'),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _kv('ID', u.id.toString()),
+                _kv('Username', u.username),
+                _kv('Email', u.email),
+                _kv('Role', u.role),
+                _kv('Active', (u.isActive ?? true) ? 'yes' : 'no'),
+                _kv('Last login', fmt(u.lastLoginAt)),
+                if (u.isSuperAdmin)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: FilledButton.icon(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => const UsersScreen(),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.group),
+                      label: const Text('Управление пользователями'),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Закрыть'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+    padding: const EdgeInsets.only(bottom: 6),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 110,
+          child: Text(
+            k,
+            style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+          ),
+        ),
+        Expanded(child: Text(v, style: const TextStyle(fontSize: 13))),
+      ],
+    ),
+  );
   Future<void> _editCoords(DeviceCoords d) async {
     final latCtrl = TextEditingController(
       text: d.lat?.toStringAsFixed(6) ?? '',
@@ -897,23 +1025,55 @@ class _EventsPanel extends StatelessWidget {
   }
 }
 
-class _DeviceSheet extends StatelessWidget {
+class _DeviceSheet extends StatefulWidget {
   final DeviceCoords device;
   final Future<void> Function(DeviceCoords, Future<void> Function(String))
   onCommand;
   final Future<void> Function(DeviceCoords) onCustom;
+
   const _DeviceSheet({
     required this.device,
     required this.onCommand,
     required this.onCustom,
   });
 
+  @override
+  State<_DeviceSheet> createState() => _DeviceSheetState();
+}
+
+class _DeviceSheetState extends State<_DeviceSheet> {
+  DeviceStatus? _status;
+  bool _loadingStatus = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStatus();
+  }
+
+  Future<void> _loadStatus() async {
+    setState(() => _loadingStatus = true);
+    try {
+      final api = ApiProvider.of(context);
+      final status = await api.fetchDeviceStatus(widget.device.id);
+      if (mounted) {
+        setState(() => _status = status);
+      }
+    } catch (_) {
+      // Игнорируем ошибки
+    } finally {
+      if (mounted) {
+        setState(() => _loadingStatus = false);
+      }
+    }
+  }
+
   Future<void> _openScenesDialog(BuildContext context, ApiService api) async {
     final scenes = [1, 2];
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Сцены для ${device.id}'),
+        title: Text('Сцены для ${widget.device.id}'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -924,8 +1084,8 @@ class _DeviceSheet extends StatelessWidget {
                 title: Text('SCENE $s'),
                 onTap: () async {
                   try {
-                    await onCommand(
-                      device,
+                    await widget.onCommand(
+                      widget.device,
                       (id) => api.sendSimpleCommand(id, 'scene/$s'),
                     );
                   } finally {
@@ -948,9 +1108,10 @@ class _DeviceSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final api = ApiProvider.of(context);
-    final last = device.lastSeenAt != null
-        ? _fmtWithTz(device.lastSeenAt!)
+    final last = widget.device.lastSeenAt != null
+        ? _fmtWithTz(widget.device.lastSeenAt!)
         : '—';
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       child: Column(
@@ -961,7 +1122,7 @@ class _DeviceSheet extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  device.id,
+                  widget.device.id,
                   style: const TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.w600,
@@ -975,32 +1136,109 @@ class _DeviceSheet extends StatelessWidget {
             ],
           ),
           Text(
-            'Координаты: ${device.lat?.toStringAsFixed(5) ?? '-'}, ${device.lon?.toStringAsFixed(5) ?? '-'}',
+            'Координаты: ${widget.device.lat?.toStringAsFixed(5) ?? '-'}, ${widget.device.lon?.toStringAsFixed(5) ?? '-'}',
           ),
           Text('Последняя активность: $last'),
-          if (device.scheduleHas)
+
+          // Статус устройства
+          if (_loadingStatus)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 8),
+                  Text(
+                    'Загрузка статуса...',
+                    style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                  ),
+                ],
+              ),
+            )
+          else if (_status != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        _status!.state == 'DEVIATION'
+                            ? Icons.warning
+                            : Icons.check_circle,
+                        size: 16,
+                        color: _status!.state == 'DEVIATION'
+                            ? Colors.orange
+                            : Colors.green,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Статус: ${_status!.state}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: _status!.state == 'DEVIATION'
+                              ? Colors.orange[800]
+                              : Colors.green[800],
+                        ),
+                      ),
+                      const Spacer(),
+                      IconButton(
+                        icon: const Icon(Icons.refresh, size: 16),
+                        tooltip: 'Обновить статус',
+                        onPressed: _loadStatus,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                      ),
+                    ],
+                  ),
+                  if (_status!.deviation != null)
+                    Text(
+                      'Отклонение: ${_status!.deviation!.toStringAsFixed(2)}',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF64748B),
+                      ),
+                    ),
+                  Text(
+                    'Обновлено: ${_fmtWithTz(_status!.ts)}',
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: Color(0xFF94A3B8),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+          if (widget.device.scheduleHas)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Row(
                 children: [
                   Icon(
-                    device.scheduleActive
+                    widget.device.scheduleActive
                         ? Icons.schedule
                         : Icons.schedule_outlined,
                     size: 16,
-                    color: device.scheduleActive
+                    color: widget.device.scheduleActive
                         ? Colors.orange
                         : Colors.grey[600],
                   ),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      device.scheduleActive
+                      widget.device.scheduleActive
                           ? 'Активно расписание (ручные команды временно заблокированы)'
                           : 'Есть расписание',
                       style: TextStyle(
                         fontSize: 12,
-                        color: device.scheduleActive
+                        color: widget.device.scheduleActive
                             ? Colors.orange[800]
                             : Colors.grey[700],
                       ),
@@ -1016,23 +1254,25 @@ class _DeviceSheet extends StatelessWidget {
             children: [
               _CmdButton(
                 label: 'Scenes',
-                onTap: device.scheduleActive
+                onTap: widget.device.scheduleActive
                     ? null
                     : () => _openScenesDialog(context, api),
               ),
               _CmdButton(
                 label: 'OFF',
                 danger: true,
-                onTap: device.scheduleActive
+                onTap: widget.device.scheduleActive
                     ? null
-                    : () => onCommand(
-                        device,
+                    : () => widget.onCommand(
+                        widget.device,
                         (id) => api.sendCustomCommand(id, const {'cmd': 'OFF'}),
                       ),
               ),
               _CmdButton(
                 label: 'Custom',
-                onTap: device.scheduleActive ? null : () => onCustom(device),
+                onTap: widget.device.scheduleActive
+                    ? null
+                    : () => widget.onCustom(widget.device),
               ),
             ],
           ),

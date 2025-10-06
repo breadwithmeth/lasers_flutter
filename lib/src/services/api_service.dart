@@ -3,6 +3,50 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../models/device.dart';
 
+class User {
+  final int id;
+  final String username;
+  final String email;
+  final String role; // admin | superadmin | etc
+  final bool? isActive;
+  final DateTime? createdAt;
+  final DateTime? lastLoginAt;
+
+  User({
+    required this.id,
+    required this.username,
+    required this.email,
+    required this.role,
+    this.isActive,
+    this.createdAt,
+    this.lastLoginAt,
+  });
+
+  factory User.fromJson(Map<String, dynamic> j) {
+    DateTime? _parse(dynamic v) {
+      if (v == null) return null;
+      try {
+        return DateTime.parse(v.toString());
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return User(
+      id: j['id'] is int ? j['id'] as int : int.parse(j['id'].toString()),
+      username: j['username'] as String? ?? '',
+      email: j['email'] as String? ?? '',
+      role: j['role'] as String? ?? 'user',
+      isActive: j['isActive'] as bool?,
+      createdAt: _parse(j['createdAt']),
+      lastLoginAt: _parse(j['lastLoginAt']),
+    );
+  }
+
+  bool get isSuperAdmin => role.toLowerCase() == 'superadmin';
+  bool get isAdmin => isSuperAdmin || role.toLowerCase() == 'admin';
+}
+
 class DeviceSchedule {
   final int id;
   final String? deviceId;
@@ -102,12 +146,14 @@ class DeviceSchedule {
 class ApiService {
   final String baseUrl; // e.g. http://localhost:8080/api/v1
   String? _token;
+  User? _currentUser; // cached
 
   ApiService({required this.baseUrl});
 
   void setToken(String token) => _token = token;
   void clearToken() => _token = null;
   bool get isAuthenticated => _token != null && _token!.isNotEmpty;
+  User? get currentUser => _currentUser;
 
   Map<String, String> _headers({bool jsonBody = true}) => {
     if (jsonBody) 'Content-Type': 'application/json',
@@ -132,6 +178,131 @@ class ApiService {
       return token;
     } else {
       throw Exception('Login failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
+  // ================= Users & Auth =================
+  Future<User> fetchCurrentUser({bool force = false}) async {
+    if (!force && _currentUser != null) return _currentUser!;
+    final uri = Uri.parse('$baseUrl/auth/me');
+    final resp = await http.get(uri, headers: _headers(jsonBody: false));
+    if (resp.statusCode == 200) {
+      final data = jsonDecode(resp.body);
+      final u = data['user'] as Map<String, dynamic>?;
+      if (u == null) throw Exception('Invalid /auth/me response');
+      _currentUser = User.fromJson(u);
+      return _currentUser!;
+    } else {
+      throw Exception('auth/me failed: ${resp.statusCode}');
+    }
+  }
+
+  Future<List<User>> fetchUsers({bool includeInactive = false}) async {
+    final uri = Uri.parse(
+      '$baseUrl/users${includeInactive ? '?includeInactive=true' : ''}',
+    );
+    final resp = await http.get(uri, headers: _headers(jsonBody: false));
+    if (resp.statusCode == 200) {
+      final data = jsonDecode(resp.body);
+      final list = (data['users'] as List?) ?? (data as List?);
+      if (list == null) return [];
+      return list.map((e) => User.fromJson(e as Map<String, dynamic>)).toList();
+    } else {
+      throw Exception('fetch users failed: ${resp.statusCode}');
+    }
+  }
+
+  Future<User> createUser({
+    required String username,
+    required String email,
+    required String password,
+    required String role,
+  }) async {
+    final uri = Uri.parse('$baseUrl/users');
+    final body = {
+      'username': username,
+      'email': email,
+      'password': password,
+      'role': role,
+    };
+    final resp = await http.post(
+      uri,
+      headers: _headers(),
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode == 200 || resp.statusCode == 201) {
+      final data = jsonDecode(resp.body);
+      final u = (data is Map && data['user'] != null)
+          ? data['user'] as Map<String, dynamic>
+          : data as Map<String, dynamic>;
+      return User.fromJson(u);
+    } else {
+      throw Exception('create user failed: ${resp.statusCode}');
+    }
+  }
+
+  Future<User> fetchUser(int id) async {
+    final uri = Uri.parse('$baseUrl/users/$id');
+    final resp = await http.get(uri, headers: _headers(jsonBody: false));
+    if (resp.statusCode == 200) {
+      final data = jsonDecode(resp.body);
+      final u = data['user'] as Map<String, dynamic>? ?? data;
+      return User.fromJson(u as Map<String, dynamic>);
+    } else {
+      throw Exception('get user failed: ${resp.statusCode}');
+    }
+  }
+
+  Future<User> updateUser(
+    int id, {
+    String? email,
+    String? role,
+    bool? isActive,
+  }) async {
+    final uri = Uri.parse('$baseUrl/users/$id');
+    final body = <String, dynamic>{
+      if (email != null) 'email': email,
+      if (role != null) 'role': role,
+      if (isActive != null) 'isActive': isActive,
+    };
+    final resp = await http.put(
+      uri,
+      headers: _headers(),
+      body: jsonEncode(body),
+    );
+    if (resp.statusCode == 200) {
+      final data = jsonDecode(resp.body);
+      final u = data['user'] as Map<String, dynamic>? ?? data;
+      return User.fromJson(u as Map<String, dynamic>);
+    } else {
+      throw Exception('update user failed: ${resp.statusCode}');
+    }
+  }
+
+  Future<void> changePassword(
+    int id, {
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    final uri = Uri.parse('$baseUrl/users/$id/change-password');
+    final resp = await http.post(
+      uri,
+      headers: _headers(),
+      body: jsonEncode({
+        'currentPassword': currentPassword,
+        'newPassword': newPassword,
+      }),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception('change password failed: ${resp.statusCode}');
+    }
+  }
+
+  Future<void> deactivateUser(int id) async {
+    final uri = Uri.parse('$baseUrl/users/$id');
+    final resp = await http.delete(uri, headers: _headers(jsonBody: false));
+    if (resp.statusCode != 200 && resp.statusCode != 204) {
+      throw Exception('deactivate user failed: ${resp.statusCode}');
     }
   }
 
@@ -192,6 +363,23 @@ class ApiService {
       throw Exception('Unexpected response format');
     } else {
       throw Exception('update coords failed: ${resp.statusCode} ${resp.body}');
+    }
+  }
+
+  Future<DeviceStatus?> fetchDeviceStatus(String deviceId) async {
+    final uri = Uri.parse('$baseUrl/device/$deviceId/status');
+    final resp = await http.get(uri, headers: _headers(jsonBody: false));
+    if (resp.statusCode == 200) {
+      final data = jsonDecode(resp.body);
+      final statusData = data['status'];
+      if (statusData is Map<String, dynamic>) {
+        return DeviceStatus.fromJson(statusData);
+      }
+      return null;
+    } else if (resp.statusCode == 404) {
+      return null;
+    } else {
+      throw Exception('fetch status failed: ${resp.statusCode}');
     }
   }
 

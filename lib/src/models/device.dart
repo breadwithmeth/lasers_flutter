@@ -122,3 +122,40 @@ class LaserEvent {
     );
   }
 }
+
+class DeviceStatus {
+  final int id;
+  final DateTime ts;
+  final String state;
+  final double? deviation;
+
+  DeviceStatus({
+    required this.id,
+    required this.ts,
+    required this.state,
+    this.deviation,
+  });
+
+  factory DeviceStatus.fromJson(Map<String, dynamic> json) {
+    DateTime _parseTs(String raw) {
+      try {
+        return DateTime.parse(raw).toLocal();
+      } catch (_) {
+        return DateTime.now();
+      }
+    }
+
+    double? _toDouble(dynamic v) {
+      if (v == null) return null;
+      if (v is num) return v.toDouble();
+      return double.tryParse(v.toString());
+    }
+
+    return DeviceStatus(
+      id: json['id'] as int,
+      ts: _parseTs(json['ts'] as String),
+      state: json['state'] as String? ?? 'UNKNOWN',
+      deviation: _toDouble(json['deviation']),
+    );
+  }
+}
